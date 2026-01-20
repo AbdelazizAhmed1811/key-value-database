@@ -38,6 +38,13 @@ We use **Locust** for load testing.
    ```
 3. Open your browser at `http://localhost:8089` to start the test.
 
+### Headless Mode (Save to File)
+To run for a specific duration and save results:
+```bash
+export PYTHONPATH=$PYTHONPATH:$(pwd)/lib
+python3.13 -m locust -f locustfile.py --headless -u 50 -r 10 --run-time 30s --csv=benchmark_results --host http://localhost:8000
+```
+
 ## 5. Manual Testing with cURL
 **Set a Value:**
 ```bash

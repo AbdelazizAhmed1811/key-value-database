@@ -86,6 +86,9 @@ class TestServerDurability(unittest.TestCase):
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.json()["value"], "persistent_value")
         
+        # Wait for background sync (interval is 1.0s, so wait 1.5s to be safe)
+        time.sleep(1.5)
+        
         # 2. Stop Server
         print("Stopping server...")
         os.kill(self.server_process.pid, signal.SIGTERM)
