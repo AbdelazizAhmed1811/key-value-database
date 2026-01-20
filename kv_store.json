@@ -1,0 +1,12 @@
+{}{"op": "SET", "key": "test_api_key", "value": "to_delete"}
+{"op": "DELETE", "key": "test_api_key"}
+{"op": "SET", "key": "test_api_key", "value": "api_value"}
+{"op": "DELETE", "key": "test_api_key"}
+{"op": "SET", "key": "test_api_key", "value": "to_delete"}
+{"op": "DELETE", "key": "test_api_key"}
+{"op": "SET", "key": "test_api_key", "value": "api_value"}
+{"op": "DELETE", "key": "test_api_key"}
+{"op": "SET", "key": "test_api_key", "value": "to_delete"}
+{"op": "DELETE", "key": "test_api_key"}
+{"op": "SET", "key": "test_api_key", "value": "api_value"}
+{"op": "DELETE", "key": "test_api_key"}

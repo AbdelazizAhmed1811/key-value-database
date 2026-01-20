@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+lib/
+*.log
+*.tmp
+*.json
+!kv_store.json
+!stress_test.json
