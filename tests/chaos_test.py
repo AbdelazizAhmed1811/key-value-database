@@ -10,7 +10,7 @@ import threading
 from typing import Dict, List, Any
 
 # Configuration
-SERVER_SCRIPT = "src/tcp_server.py"
+SERVER_SCRIPT = "src/server.py"
 DB_FILE = "chaos_test.json"
 PORT = 9000
 HOST = "localhost"

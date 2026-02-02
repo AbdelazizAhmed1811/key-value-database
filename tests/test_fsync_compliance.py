@@ -5,7 +5,7 @@ import asyncio
 import tempfile
 import shutil
 from src.kv_store import KeyValueStore
-from src.tcp_server import BatchWALWriter
+from src.server import BatchWALWriter
 
 class TestPowerSafety(unittest.TestCase):
     def setUp(self):

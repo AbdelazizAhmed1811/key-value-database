@@ -4,36 +4,12 @@ import os
 import sys
 import subprocess
 import signal
-import socket
 import json
+from src.client import TCPClient
 
 HOST = "localhost"
 PORT = int(os.getenv("KV_SERVER_PORT", 8000))
 DB_FILE = "common_test.json"
-
-class TCPClient:
-    def __init__(self):
-        self.host = HOST
-        self.port = PORT
-
-    def send_command(self, command):
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.connect((self.host, self.port))
-                s.sendall((json.dumps(command) + "\n").encode('utf-8'))
-                data = s.recv(4096)
-                return json.loads(data.decode('utf-8').strip())
-        except Exception:
-            return None
-
-    def set(self, key, value):
-        return self.send_command({"command": "SET", "key": key, "value": value})
-
-    def get(self, key):
-        return self.send_command({"command": "GET", "key": key})
-
-    def delete(self, key):
-        return self.send_command({"command": "DELETE", "key": key})
 
 class TestCommonScenarios(unittest.TestCase):
     def setUp(self):
@@ -41,7 +17,7 @@ class TestCommonScenarios(unittest.TestCase):
         if os.path.exists(DB_FILE):
              os.remove(DB_FILE)
         self.start_server()
-        self.client = TCPClient()
+        self.client = TCPClient(HOST, PORT)
 
     def start_server(self):
         # Force kill any lingering server
@@ -54,7 +30,7 @@ class TestCommonScenarios(unittest.TestCase):
         env["PYTHONPATH"] = os.getcwd()
         
         self.server_process = subprocess.Popen(
-            [sys.executable, "-u", "src/tcp_server.py"],
+            [sys.executable, "-u", "src/server.py"],
             env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE
