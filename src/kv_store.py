@@ -1,8 +1,8 @@
 import json
 import os
 import threading
-import time
-from typing import Any, Dict, Optional
+import random
+from typing import Any, Dict, Optional, List, Tuple
 
 class KeyNotFoundError(Exception):
     """Raised when a key is not found in the database."""
@@ -12,29 +12,23 @@ class KeyValueStore:
     """
     A persistent key-value store using a Transaction Log (WAL).
     Operations are appended to the log file.
-    Uses Periodic Sync (Group Commit) for high performance.
+    Uses Group Commit (handled externally) for high performance.
+    Thread-safe memory operations.
     """
 
-    def __init__(self, filename: str = "kv_store.log", sync_interval: float = 1.0):
+    def __init__(self, filename: str = "kv_store.log"):
         """
         Initialize the KeyValueStore.
 
         Args:
             filename: The name of the log file to use for persistence.
-            sync_interval: Time in seconds between disk syncs (fsync).
         """
         self.filename = filename
-        self.sync_interval = sync_interval
         self.store: Dict[str, Any] = {}
-        self._replay_log()
+        self.lock = threading.Lock()
         
-        # Open file in append mode and keep it open
         self.log_file = open(self.filename, 'a')
-        
-        # Start background sync thread
-        self.running = True
-        self.sync_thread = threading.Thread(target=self._background_sync, daemon=True)
-        self.sync_thread.start()
+        self._replay_log()
 
     def _replay_log(self) -> None:
         """Replay the log file to reconstruct the in-memory state."""
@@ -59,35 +53,34 @@ class KeyValueStore:
                                 del self.store[key]
                         elif op == "INCR":
                             amount = entry.get("amount", 1)
-                            current_value = self.store.get(key, 0)
-                            if isinstance(current_value, int):
-                                self.store[key] = current_value + amount
+                            value = self.store.get(key, 0)
+                            if isinstance(value, int):
+                                self.store[key] = value + amount
                     except json.JSONDecodeError:
                         continue
         except IOError:
             pass
 
-    def _background_sync(self) -> None:
-        """Periodically fsync the log file to disk."""
-        while self.running:
-            time.sleep(self.sync_interval)
-            try:
-                if self.log_file and not self.log_file.closed:
-                    self.log_file.flush()
-                    os.fsync(self.log_file.fileno())
-            except ValueError:
-                pass # File might be closed during compaction
-
-    def _append_log(self, entry: Dict[str, Any]) -> None:
+    def _append_log(self, entry: Dict[str, Any], simulate_failure: bool = False) -> None:
         """
         Append an entry to the log file.
-        Writes to OS buffer immediately, fsync handled by background thread.
+        Writes to OS buffer immediately.
+        simulate_failure: If True, 1% chance to skip writing (simulate data loss).
         """
+        if simulate_failure and random.random() < 0.01:
+            return
+
         self.log_file.write(json.dumps(entry) + "\n")
         self.log_file.flush()
 
-    def write_batch(self, entries: list[Dict[str, Any]]) -> None:
-        """Write a batch of entries to the log and fsync."""
+    def write_batch(self, entries: list[Dict[str, Any]], simulate_failure: bool = False) -> None:
+        """
+        Write a batch of entries to the log and fsync.
+        simulate_failure: If True, 1% chance to skip writing.
+        """
+        if simulate_failure and random.random() < 0.01:
+            return
+
         if not entries:
             return
         
@@ -97,41 +90,61 @@ class KeyValueStore:
         # fsync to ensure durability against power loss
         os.fsync(self.log_file.fileno())
 
-    def set(self, key: str, value: Any, sync: bool = True) -> Optional[Dict[str, Any]]:
+    def set(self, key: str, value: Any, sync: bool = True, simulate_failure: bool = False) -> Optional[Dict[str, Any]]:
         """Create or update a key with a value."""
-        self.store[key] = value
-        entry = {"op": "SET", "key": key, "value": value}
+        with self.lock:
+            self.store[key] = value
+            entry = {"op": "SET", "key": key, "value": value}
+        
         if sync:
-            self._append_log(entry)
+            self._append_log(entry, simulate_failure=simulate_failure)
             return None
         return entry
+
+    def bulk_set(self, items: List[Tuple[str, Any]]) -> Optional[List[Dict[str, Any]]]:
+        """
+        Atomically set multiple keys. 
+        Returns list of entries to be persisted if sync=False.
+        """
+        entries = []
+        with self.lock:
+            for key, value in items:
+                self.store[key] = value
+                entries.append({"op": "SET", "key": key, "value": value})
+        
+        return entries
 
     def get(self, key: str) -> Optional[Any]:
         """Retrieve a value by its key."""
-        return self.store.get(key)
+        with self.lock:
+            return self.store.get(key)
 
     def delete(self, key: str, sync: bool = True) -> Optional[Dict[str, Any]]:
         """Remove a key from the store."""
-        if key not in self.store:
-            raise KeyNotFoundError(f"Key '{key}' not found.")
+        with self.lock:
+            if key not in self.store:
+                raise KeyNotFoundError(f"Key '{key}' not found.")
+            
+            del self.store[key]
+            entry = {"op": "DELETE", "key": key}
         
-        del self.store[key]
-        entry = {"op": "DELETE", "key": key}
         if sync:
             self._append_log(entry)
             return None
         return entry
 
-    def incr(self, key: str, amount: int = 1, sync: bool = True) -> tuple[int, Optional[Dict[str, Any]]]:
+    def incr(self, key: str, amount: int = 1, sync: bool = True) -> Tuple[int, Optional[Dict[str, Any]]]:
         """Increment the integer value of a key by the given amount."""
-        current_value = self.store.get(key, 0)
-        
-        if not isinstance(current_value, int):
-            raise ValueError(f"Key '{key}' cannot be incremented: value is not an integer.")
+        with self.lock:
+            current_value = self.store.get(key, 0)
             
-        new_value = current_value + amount
-        self.store[key] = new_value
-        entry = {"op": "INCR", "key": key, "amount": amount}
+            if not isinstance(current_value, int):
+                raise ValueError(f"Key '{key}' cannot be incremented: value is not an integer.")
+                
+            new_value = current_value + amount
+            self.store[key] = new_value
+            entry = {"op": "INCR", "key": key, "amount": amount}
+            
         if sync:
             self._append_log(entry)
             return new_value, None
@@ -147,7 +160,10 @@ class KeyValueStore:
         temp_filename = f"{self.filename}.tmp"
         try:
             with open(temp_filename, 'w') as f:
-                for key, value in self.store.items():
+                with self.lock: # Lock during snapshotting
+                    snapshot = self.store.copy()
+                
+                for key, value in snapshot.items():
                     entry = {"op": "SET", "key": key, "value": value}
                     f.write(json.dumps(entry) + "\n")
                 f.flush()
@@ -167,10 +183,6 @@ class KeyValueStore:
 
     def close(self):
         """Clean shutdown."""
-        self.running = False
-        if self.sync_thread.is_alive():
-            self.sync_thread.join(timeout=1.0)
-        
         if self.log_file and not self.log_file.closed:
             self.log_file.flush()
             os.fsync(self.log_file.fileno())

@@ -39,6 +39,12 @@ class TCPClient:
     def incr(self, key: str, amount: int = 1) -> Dict[str, Any]:
         return self.send_command({"command": "INCR", "key": key, "amount": amount})
 
+    def bulk_set(self, items: list[tuple[str, Any]]) -> Dict[str, Any]:
+        """items: List of (key, value) tuples"""
+        # We send a dummy key purely to satisfy the current server validation check 
+        # (if not cmd_type or not key) which is common for single-key ops.
+        return self.send_command({"command": "BULK_SET", "key": "batch", "items": items})
+
 def main():
     print("--- Key-Value Database TCP Client Demo ---")
     client = TCPClient()
@@ -52,7 +58,16 @@ def main():
     resp = client.set("score", 100)
     print(f"Response: {resp}")
 
-    # 2. GET Operation
+    # 2. BULK SET (New)
+    print("\n[BULK SET] Setting multiple keys...")
+    bulk_data = [("k1", "v1"), ("k2", "v2"), ("k3", "v3")]
+    resp = client.bulk_set(bulk_data)
+    print(f"Response: {resp}")
+    
+    print("[GET] k1...")
+    print(f"Response: {client.get('k1')}")
+
+    # 3. GET Operation
     print(f"\n[GET] user...")
     resp = client.get("user")
     print(f"Response: {resp}")
@@ -61,7 +76,7 @@ def main():
     resp = client.get("score")
     print(f"Response: {resp}")
 
-    # 3. INCR Operation
+    # 4. INCR Operation
     print(f"\n[INCR] Incrementing 'score' by 10...")
     resp = client.incr("score", 10)
     print(f"Response: {resp}")
@@ -70,7 +85,7 @@ def main():
     resp = client.get("score")
     print(f"Response: {resp}")
 
-    # 4. DELETE Operation
+    # 5. DELETE Operation
     print("\n[DELETE] Deleting 'score'...")
     resp = client.delete("score")
     print(f"Response: {resp}")

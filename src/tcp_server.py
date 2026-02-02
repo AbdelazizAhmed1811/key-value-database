@@ -25,23 +25,33 @@ class BatchWALWriter:
         if self.task:
             await self.task
 
-    async def submit(self, entry: Dict[str, Any]) -> None:
-        """Submit an entry to be persisted and wait for it."""
+    async def submit(self, entry: Any, simulate_failure: bool = False) -> None:
+        """Submit an entry (or list of entries) to be persisted and wait."""
         loop = asyncio.get_running_loop()
         future = loop.create_future()
-        await self.queue.put((entry, future))
+        await self.queue.put((entry, future, simulate_failure))
         await future
 
     async def _process_batches(self):
         loop = asyncio.get_running_loop()
         while self.running:
             # Wait for at least one item
-            entry, future = await self.queue.get()
+            item = await self.queue.get()
+            entry = item[0]
+            future = item[1]
+            simulate_failure = item[2] if len(item) > 2 else False
+
             if entry is None: # Sentinel received
                 break
             
-            batch_entries = [entry]
+            # Handle both single entry and list of entries (from bulk_set)
+            if isinstance(entry, list):
+                batch_entries = entry
+            else:
+                batch_entries = [entry]
+            
             futures = [future]
+            batch_simulate_failure = simulate_failure
             
             # Smart Batching: 
             # With pipelined processing, the queue fills up naturally under load.
@@ -52,8 +62,18 @@ class BatchWALWriter:
             # Drain the queue to form a batch
             while not self.queue.empty():
                 try:
-                    entry, future = self.queue.get_nowait()
-                    batch_entries.append(entry)
+                    item = self.queue.get_nowait()
+                    entry = item[0]
+                    future = item[1]
+                    s_fail = item[2] if len(item) > 2 else False
+                    
+                    if s_fail:
+                        batch_simulate_failure = True
+
+                    if isinstance(entry, list):
+                        batch_entries.extend(entry)
+                    else:
+                        batch_entries.append(entry)
                     futures.append(future)
                     # Limit batch size
                     if len(batch_entries) >= 2000:
@@ -64,7 +84,7 @@ class BatchWALWriter:
             # Flush batch to disk (Blocking I/O in thread pool)
             if batch_entries:
                 try:
-                    await loop.run_in_executor(None, self.db.write_batch, batch_entries)
+                    await loop.run_in_executor(None, lambda: self.db.write_batch(batch_entries, simulate_failure=batch_simulate_failure))
                     # Notify all clients
                     for f in futures:
                         if not f.done():
@@ -136,11 +156,12 @@ class AsyncTCPServer:
 
             if cmd_type == "SET":
                 value = command.get("value")
+                simulate_failure = command.get("simulate_failure", False)
                 # Update memory immediately, get entry to persist
                 entry = self.db.set(key, value, sync=False)
                 if entry:
                     # Wait for durability
-                    await self.batcher.submit(entry)
+                    await self.batcher.submit(entry, simulate_failure=simulate_failure)
                 return {"status": "success", "result": "OK"}
             
             elif cmd_type == "GET":
@@ -167,6 +188,25 @@ class AsyncTCPServer:
                         await self.batcher.submit(entry)
                     return {"status": "success", "result": new_value}
                 except ValueError as e:
+                    return {"status": "error", "message": str(e)}
+
+            elif cmd_type == "BULK_SET":
+                items = command.get("items") # Expecting list of [key, value]
+                simulate_failure = command.get("simulate_failure", False)
+                
+                if not items or not isinstance(items, list):
+                     return {"status": "error", "message": "Missing or invalid 'items' list"}
+                
+                # Convert list of lists to list of tuples for strict typing if needed
+                # kv_store.bulk_set expects List[Tuple[str, Any]]
+                try:
+                    # Atomic Memory Update
+                    entries = self.db.bulk_set(items)
+                    if entries:
+                        # Atomic Disk Persistence (Passed as a single list to batcher)
+                         await self.batcher.submit(entries, simulate_failure=simulate_failure)
+                    return {"status": "success", "result": "OK"}
+                except Exception as e:
                     return {"status": "error", "message": str(e)}
 
             else:
