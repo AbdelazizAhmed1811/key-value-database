@@ -2,13 +2,13 @@ import asyncio
 import json
 import os
 import signal
+import sys
+import argparse
 from typing import Any, Dict, List, Optional
 from src.kv_store import KeyValueStore, KeyNotFoundError
+from src.raft import RaftNode
 
 class BatchWALWriter:
-    """
-    Batches write operations and flushes them to disk using Group Commit.
-    """
     def __init__(self, db: KeyValueStore, batch_interval: float = 0.001):
         self.db = db
         self.queue: asyncio.Queue = asyncio.Queue()
@@ -21,12 +21,11 @@ class BatchWALWriter:
 
     async def stop(self):
         self.running = False
-        await self.queue.put((None, None)) # Sentinel to unblock get()
+        await self.queue.put((None, None))
         if self.task:
             await self.task
 
     async def submit(self, entry: Any, simulate_failure: bool = False) -> None:
-        """Submit an entry (or list of entries) to be persisted and wait."""
         loop = asyncio.get_running_loop()
         future = loop.create_future()
         await self.queue.put((entry, future, simulate_failure))
@@ -35,16 +34,14 @@ class BatchWALWriter:
     async def _process_batches(self):
         loop = asyncio.get_running_loop()
         while self.running:
-            # Wait for at least one item
             item = await self.queue.get()
             entry = item[0]
             future = item[1]
             simulate_failure = item[2] if len(item) > 2 else False
 
-            if entry is None: # Sentinel received
+            if entry is None:
                 break
             
-            # Handle both single entry and list of entries (from bulk_set)
             if isinstance(entry, list):
                 batch_entries = entry
             else:
@@ -53,13 +50,6 @@ class BatchWALWriter:
             futures = [future]
             batch_simulate_failure = simulate_failure
             
-            # Smart Batching: 
-            # With pipelined processing, the queue fills up naturally under load.
-            # Explicit sleep hurts latency for single clients (like chaos test).
-            # if self.queue.empty():
-            #    await asyncio.sleep(0.005)
-
-            # Drain the queue to form a batch
             while not self.queue.empty():
                 try:
                     item = self.queue.get_nowait()
@@ -75,17 +65,14 @@ class BatchWALWriter:
                     else:
                         batch_entries.append(entry)
                     futures.append(future)
-                    # Limit batch size
                     if len(batch_entries) >= 2000:
                         break
                 except asyncio.QueueEmpty:
                     break
             
-            # Flush batch to disk (Blocking I/O in thread pool)
             if batch_entries:
                 try:
                     await loop.run_in_executor(None, lambda: self.db.write_batch(batch_entries, simulate_failure=batch_simulate_failure))
-                    # Notify all clients
                     for f in futures:
                         if not f.done():
                             f.set_result(None)
@@ -96,181 +83,162 @@ class BatchWALWriter:
                             f.set_exception(e)
 
 class AsyncTCPServer:
-    def __init__(self, host: str = "0.0.0.0", port: int = 8000, db_file: str = "kv_store.json"):
+    def __init__(self, host: str, port: int, node_id: str, peers: List[str], db_file: str = "kv_store.json"):
         self.host = host
         self.port = port
+        self.node_id = node_id
         self.db = KeyValueStore(db_file)
         self.batcher = BatchWALWriter(self.db)
         self.running = True
-
-    async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
-        addr = writer.get_extra_info('peername')
-        buffer = b""
+        
+        # Raft
+        self_address = f"{host}:{port}" if host != "0.0.0.0" else f"127.0.0.1:{port}"
+        self.raft = RaftNode(node_id, peers, self, self_address=self_address)
+        
+    async def send_rpc(self, peer: str, msg: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Send JSON RPC to a peer."""
         try:
-            while True:
-                data = await reader.read(65536) # 64KB buffer for larger batches
-                if not data:
-                    break
+            async with asyncio.timeout(0.5):
+                host, port = peer.split(":")
+                reader, writer = await asyncio.open_connection(host, int(port))
                 
-                buffer += data
+                writer.write(json.dumps(msg).encode('utf-8') + b"\n")
+                await writer.drain()
                 
-                tasks = []
-                while b"\n" in buffer:
-                    line_bytes, buffer = buffer.split(b"\n", 1)
-                    line = line_bytes.decode('utf-8').strip()
-                    if not line:
-                        continue
-                    tasks.append(self.process_command(line))
+                data = await reader.read(65536)
+                writer.close()
+                await writer.wait_closed()
                 
-                if tasks:
-                    # Execute all parsed commands concurrently
-                    # This allows the batcher to see all of them at once!
-                    responses = await asyncio.gather(*tasks)
-                    
-                    # Send responses in order
-                    for response in responses:
-                        writer.write(json.dumps(response).encode('utf-8') + b"\n")
-                    await writer.drain()
-            
-            # await writer.drain() # Moved inside
-                    
-        except ConnectionResetError:
-            pass
+                if data:
+                    return json.loads(data.decode('utf-8'))
+                return None
         except Exception as e:
-            print(f"Error handling client {addr}: {e}")
-        finally:
-            writer.close()
-            await writer.wait_closed()
+            return None
 
-    async def process_command(self, command_str: str) -> Dict[str, Any]:
-        """Process a single JSON command asynchronously."""
+    async def apply_to_fsm(self, command: Dict[str, Any]):
+        cmd_type = command.get("command")
+        key = command.get("key")
         try:
-            command = json.loads(command_str)
-            cmd_type = command.get("command")
-            key = command.get("key")
-
-            if not cmd_type or not key:
-                return {"status": "error", "message": "Missing 'command' or 'key'"}
-
-            loop = asyncio.get_running_loop()
-
             if cmd_type == "SET":
                 value = command.get("value")
                 simulate_failure = command.get("simulate_failure", False)
-                # Update memory immediately, get entry to persist
                 entry = self.db.set(key, value, sync=False)
                 if entry:
-                    # Wait for durability
                     await self.batcher.submit(entry, simulate_failure=simulate_failure)
-                return {"status": "success", "result": "OK"}
-            
-            elif cmd_type == "GET":
-                # GET is strictly in-memory
-                value = self.db.get(key)
-                if value is None:
-                    return {"status": "error", "message": "Key not found"}
-                return {"status": "success", "result": value}
-            
             elif cmd_type == "DELETE":
                 try:
                     entry = self.db.delete(key, sync=False)
                     if entry:
                         await self.batcher.submit(entry)
-                    return {"status": "success", "result": "OK"}
                 except KeyNotFoundError:
-                    return {"status": "error", "message": "Key not found"}
-            
+                    pass
             elif cmd_type == "INCR":
                 amount = command.get("amount", 1)
                 try:
-                    new_value, entry = self.db.incr(key, amount, sync=False)
+                    new_val, entry = self.db.incr(key, amount, sync=False)
                     if entry:
                         await self.batcher.submit(entry)
-                    return {"status": "success", "result": new_value}
-                except ValueError as e:
-                    return {"status": "error", "message": str(e)}
-
+                except ValueError:
+                    pass
             elif cmd_type == "BULK_SET":
-                items = command.get("items") # Expecting list of [key, value]
+                items = command.get("items")
                 simulate_failure = command.get("simulate_failure", False)
-                
-                if not items or not isinstance(items, list):
-                     return {"status": "error", "message": "Missing or invalid 'items' list"}
-                
-                # Convert list of lists to list of tuples for strict typing if needed
-                # kv_store.bulk_set expects List[Tuple[str, Any]]
-                try:
-                    # Atomic Memory Update
-                    entries = self.db.bulk_set(items)
-                    if entries:
-                        # Atomic Disk Persistence (Passed as a single list to batcher)
-                         await self.batcher.submit(entries, simulate_failure=simulate_failure)
-                    return {"status": "success", "result": "OK"}
-                except Exception as e:
-                    return {"status": "error", "message": str(e)}
+                entries = self.db.bulk_set(items)
+                if entries:
+                    await self.batcher.submit(entries, simulate_failure=simulate_failure)
+        except Exception as e:
+            print(f"FSM Apply Error: {e}")
 
-            else:
-                return {"status": "error", "message": f"Unknown command: {cmd_type}"}
+    async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+        addr = writer.get_extra_info('peername')
+        try:
+            while True:
+                data = await reader.read(65536)
+                if not data:
+                    break
+                buffer = data.decode('utf-8')
+                for line in buffer.splitlines():
+                    if not line: continue
+                    response = await self.process_message(line)
+                    writer.write(json.dumps(response).encode('utf-8') + b"\n")
+                await writer.drain()
+        except Exception as e:
+            print(f"Error handling client {addr}: {e}")
+            pass
+        finally:
+            writer.close()
+            await writer.wait_closed()
 
+    async def process_message(self, msg_str: str) -> Dict[str, Any]:
+        try:
+            msg = json.loads(msg_str)
         except json.JSONDecodeError:
             return {"status": "error", "message": "Invalid JSON"}
-        except Exception as e:
-            return {"status": "error", "message": str(e)}
+        if "type" in msg and msg["type"] in ["RequestVote", "AppendEntries"]:
+            return await self.raft.handle_rpc(msg)
+        return await self.process_client_command(msg)
+
+    async def process_client_command(self, command: Dict[str, Any]) -> Dict[str, Any]:
+        cmd_type = command.get("command")
+        key = command.get("key")
+        if self.raft.role != "LEADER":
+            leader = self.raft.leader_id
+            return {"status": "error", "message": "Not Leader", "redirect": leader}
+        if cmd_type == "GET":
+            value = self.db.get(key)
+            if value is None:
+                return {"status": "error", "message": "Key not found"}
+            return {"status": "success", "result": value}
+        success = await self.raft.propose_command(command)
+        if success:
+            if cmd_type == "INCR":
+                val = self.db.get(key)
+                return {"status": "success", "result": val}
+            return {"status": "success", "result": "OK"}
+        else:
+            return {"status": "error", "message": "Raft Proposal Failed (Timeout or Leadership lost)"}
 
     async def start(self):
         await self.batcher.start()
-        
+        await self.raft.start()
         server = await asyncio.start_server(
             self.handle_client, self.host, self.port, reuse_address=True)
-
-        addrs = ', '.join(str(sock.getsockname()) for sock in server.sockets)
-        print(f"High-Performance Async TCP Server listening on {addrs}")
-
+        print(f"[{self.raft.node_id}] Server listening on {self.host}:{self.port}")
         async with server:
             await server.serve_forever()
 
     async def stop(self):
+        await self.raft.stop()
         await self.batcher.stop()
         self.db.close()
 
 async def main():
-    port = int(os.getenv("KV_SERVER_PORT", 8000))
-    db_file = os.getenv("KV_STORE_FILE", "kv_store.json")
-    
-    server = AsyncTCPServer(port=port, db_file=db_file)
-    
-    # Handle graceful shutdown
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--id", type=str, default="node1")
+    parser.add_argument("--peers", type=str, default="", help="Comma separated list of peer host:port")
+    args = parser.parse_args()
+    peers = [p for p in args.peers.split(",") if p]
+    db_file = f"kv_store_{args.id}.json"
+    server = AsyncTCPServer(host="0.0.0.0", port=args.port, node_id=args.id, peers=peers, db_file=db_file)
     loop = asyncio.get_running_loop()
     stop_event = asyncio.Event()
-    
     def signal_handler():
         print("\nReceived signal, stopping...")
         stop_event.set()
-
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, signal_handler)
-
-    # Start server in a task so we can wait on stop_event
     server_task = asyncio.create_task(server.start())
-    
-    # Wait for signal
     try:
         await stop_event.wait()
     except asyncio.CancelledError:
         pass
-        
     print("Shutting down...")
-    # Stop receiving new connections (implicit in valid implementation, but here we just stop internal components)
-    # Ideally server.start() should return so we can close strict server object, 
-    # but AsyncTCPServer.start calls serve_forever.
-    # We will cancel the server task.
     server_task.cancel()
     try:
         await server_task
     except asyncio.CancelledError:
         pass
-        
-    # Flush remaining data and close DB
     await server.stop()
     print("Shutdown complete.")
 
