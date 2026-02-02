@@ -167,9 +167,3 @@ python3.13 benchmarks/pipeline.py
 │   └── pipeline.py
 └── run_verification.sh
 ```
-
----
-
-## License
-
-MIT
