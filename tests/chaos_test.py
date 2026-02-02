@@ -27,6 +27,7 @@ def start_server():
     env = os.environ.copy()
     env["KV_SERVER_PORT"] = str(PORT)
     env["KV_STORE_FILE"] = DB_FILE
+    env["PYTHONPATH"] = os.getcwd() # Fix import error
     # Use unbuffered output for python
     process = subprocess.Popen(
         [sys.executable, "-u", SERVER_SCRIPT],
@@ -163,12 +164,22 @@ def run_chaos_test():
     
     # Cleanup
     kill_server(server_process)
+    
+    # Print server output for debugging
+    stdout, stderr = server_process.communicate()
+    print("\n--- Server Output ---")
+    if stdout: print(stdout.decode('utf-8'))
+    if stderr: print(stderr.decode('utf-8'))
+    
     if os.path.exists(DB_FILE):
         os.remove(DB_FILE)
         
-    if durability_score == 100.0:
+    if durability_score == 100.0 and len(acked_writes) > 0:
         print("TEST PASSED: Perfect Durability for Acknowledged Writes")
         sys.exit(0)
+    elif len(acked_writes) == 0:
+        print("TEST INCONCLUSIVE: 0 Acknowledged Writes (Server failed?)")
+        sys.exit(1)
     else:
         print("TEST FAILED: Data Loss Detected")
         sys.exit(1)

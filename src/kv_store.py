@@ -85,29 +85,44 @@ class KeyValueStore:
         """
         self.log_file.write(json.dumps(entry) + "\n")
         self.log_file.flush()
-        # We flush to OS buffer immediately to survive application crashes (SIGKILL).
-        # fsync is still handled by background thread to batch disk I/O for performance.
 
-    def set(self, key: str, value: Any) -> bool:
+    def write_batch(self, entries: list[Dict[str, Any]]) -> None:
+        """Write a batch of entries to the log and fsync."""
+        if not entries:
+            return
+        
+        payload = "".join(json.dumps(entry) + "\n" for entry in entries)
+        self.log_file.write(payload)
+        self.log_file.flush()
+        # fsync to ensure durability against power loss
+        os.fsync(self.log_file.fileno())
+
+    def set(self, key: str, value: Any, sync: bool = True) -> Optional[Dict[str, Any]]:
         """Create or update a key with a value."""
         self.store[key] = value
-        self._append_log({"op": "SET", "key": key, "value": value})
-        return True
+        entry = {"op": "SET", "key": key, "value": value}
+        if sync:
+            self._append_log(entry)
+            return None
+        return entry
 
     def get(self, key: str) -> Optional[Any]:
         """Retrieve a value by its key."""
         return self.store.get(key)
 
-    def delete(self, key: str) -> bool:
+    def delete(self, key: str, sync: bool = True) -> Optional[Dict[str, Any]]:
         """Remove a key from the store."""
         if key not in self.store:
             raise KeyNotFoundError(f"Key '{key}' not found.")
         
         del self.store[key]
-        self._append_log({"op": "DELETE", "key": key})
-        return True
+        entry = {"op": "DELETE", "key": key}
+        if sync:
+            self._append_log(entry)
+            return None
+        return entry
 
-    def incr(self, key: str, amount: int = 1) -> int:
+    def incr(self, key: str, amount: int = 1, sync: bool = True) -> tuple[int, Optional[Dict[str, Any]]]:
         """Increment the integer value of a key by the given amount."""
         current_value = self.store.get(key, 0)
         
@@ -116,8 +131,11 @@ class KeyValueStore:
             
         new_value = current_value + amount
         self.store[key] = new_value
-        self._append_log({"op": "INCR", "key": key, "amount": amount})
-        return new_value
+        entry = {"op": "INCR", "key": key, "amount": amount}
+        if sync:
+            self._append_log(entry)
+            return new_value, None
+        return new_value, entry
 
     def compact(self) -> None:
         """Compact the log file."""

@@ -9,8 +9,8 @@ import os
 
 HOST = "localhost"
 PORT = int(os.getenv("KV_SERVER_PORT", 8000))
-NUM_REQUESTS = 10000
-CONCURRENCY = 50
+NUM_REQUESTS = 50000 # Increased total requests
+CONCURRENCY = 500 # Increased concurrency to saturate batching
 
 def get_client():
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
