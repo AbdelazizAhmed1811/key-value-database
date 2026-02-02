@@ -11,3 +11,4 @@ lib/
 *.json
 !kv_store.json
 !stress_test.json
+RUNNING.md
