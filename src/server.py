@@ -181,14 +181,49 @@ class AsyncTCPServer:
     async def process_client_command(self, command: Dict[str, Any]) -> Dict[str, Any]:
         cmd_type = command.get("command")
         key = command.get("key")
-        if self.raft.role != "LEADER":
-            leader = self.raft.leader_id
-            return {"status": "error", "message": "Not Leader", "redirect": leader}
+
+        # Read-only commands can be handled by any node
         if cmd_type == "GET":
+            if self.raft.role != "LEADER":
+                leader = self.raft.leader_id
+                return {"status": "error", "message": "Not Leader", "redirect": leader}
             value = self.db.get(key)
             if value is None:
                 return {"status": "error", "message": "Key not found"}
             return {"status": "success", "result": value}
+
+        # Search commands (read-only)
+        if cmd_type == "SEARCH":
+            query = command.get("query", "")
+            top_k = command.get("top_k", 10)
+            results = self.db.search(query, top_k)
+            return {"status": "success", "result": [{"key": k, "score": s} for k, s in results]}
+
+        if cmd_type == "SEMANTIC_SEARCH":
+            query = command.get("query", "")
+            top_k = command.get("top_k", 10)
+            results = self.db.semantic_search(query, top_k)
+            return {"status": "success", "result": [{"key": k, "similarity": s} for k, s in results]}
+
+        if cmd_type == "QUERY_INDEX":
+            field = command.get("field")
+            value = command.get("value")
+            try:
+                keys = self.db.query_index(field, value)
+                return {"status": "success", "result": keys}
+            except KeyError as e:
+                return {"status": "error", "message": str(e)}
+
+        if cmd_type == "CREATE_INDEX":
+            field = command.get("field")
+            self.db.create_index(field)
+            return {"status": "success", "result": f"Index created on field '{field}'"}
+
+        # Write commands require leader
+        if self.raft.role != "LEADER":
+            leader = self.raft.leader_id
+            return {"status": "error", "message": "Not Leader", "redirect": leader}
+
         success = await self.raft.propose_command(command)
         if success:
             if cmd_type == "INCR":

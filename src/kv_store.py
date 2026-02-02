@@ -3,6 +3,7 @@ import os
 import threading
 import random
 from typing import Any, Dict, Optional, List, Tuple
+from src.indexing import IndexManager
 
 class KeyNotFoundError(Exception):
     """Raised when a key is not found in the database."""
@@ -26,6 +27,7 @@ class KeyValueStore:
         self.filename = filename
         self.store: Dict[str, Any] = {}
         self.lock = threading.Lock()
+        self.index_manager = IndexManager()
         
         self.log_file = open(self.filename, 'a')
         self._replay_log()
@@ -58,6 +60,9 @@ class KeyValueStore:
                                 self.store[key] = value + amount
                     except json.JSONDecodeError:
                         continue
+            # Rebuild indexes
+            for key, value in self.store.items():
+                self.index_manager.on_set(key, value)
         except IOError:
             pass
 
@@ -93,7 +98,9 @@ class KeyValueStore:
     def set(self, key: str, value: Any, sync: bool = True, simulate_failure: bool = False) -> Optional[Dict[str, Any]]:
         """Create or update a key with a value."""
         with self.lock:
+            old_value = self.store.get(key)
             self.store[key] = value
+            self.index_manager.on_set(key, value, old_value)
             entry = {"op": "SET", "key": key, "value": value}
         
         if sync:
@@ -109,7 +116,9 @@ class KeyValueStore:
         entries = []
         with self.lock:
             for key, value in items:
+                old_value = self.store.get(key)
                 self.store[key] = value
+                self.index_manager.on_set(key, value, old_value)
                 entries.append({"op": "SET", "key": key, "value": value})
         
         return entries
@@ -125,7 +134,9 @@ class KeyValueStore:
             if key not in self.store:
                 raise KeyNotFoundError(f"Key '{key}' not found.")
             
+            value = self.store[key]
             del self.store[key]
+            self.index_manager.on_delete(key, value)
             entry = {"op": "DELETE", "key": key}
         
         if sync:
@@ -187,3 +198,26 @@ class KeyValueStore:
             self.log_file.flush()
             os.fsync(self.log_file.fileno())
             self.log_file.close()
+
+    # ==================== Indexing & Search ====================
+
+    def create_index(self, field: str) -> None:
+        """Create a secondary index on a field."""
+        with self.lock:
+            self.index_manager.create_value_index(field)
+            # Rebuild index from existing data
+            for key, value in self.store.items():
+                self.index_manager.value_indexes[field].add(key, value)
+
+    def query_index(self, field: str, value: Any) -> List[str]:
+        """Query a secondary index for keys where field == value."""
+        return self.index_manager.query_value_index(field, value)
+
+    def search(self, query: str, top_k: int = 10) -> List[Tuple[str, float]]:
+        """Full-text search using BM25."""
+        return self.index_manager.search(query, top_k)
+
+    def semantic_search(self, query: str, top_k: int = 10) -> List[Tuple[str, float]]:
+        """Semantic similarity search using TF-IDF cosine similarity."""
+        return self.index_manager.semantic_search(query, top_k)
+
